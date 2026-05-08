@@ -16,7 +16,7 @@ You are given:
 
 Your job: look at what the findings leave unresolved, ambiguous, or only partially answered. Generate follow-up sub-questions for those gaps — but only if they are relevant to the original query.
 
-Return decompose=true with 3-5 follow-up sub-questions when the findings:
+Return decompose=true with up to 3 follow-up sub-questions when the findings:
 - Reference claims, numbers, or events without enough supporting detail
 - Surface a disagreement or contradiction that needs more investigation
 - Mention a factor (risk, driver, comparison) that is relevant to the original query but not yet explored
@@ -26,7 +26,7 @@ Return decompose=false only when:
 - Any follow-up questions would not be relevant to the original query
 - The findings are genuinely complete for the scope of the sub-question
 
-When decomposing, return 3-5 sub-questions that:
+When decomposing, return at most 3 sub-questions (fewer is fine — quality over quantity) that:
 - Each target a specific unresolved thread from the findings
 - Are relevant to the original query
 - Are answerable through web search`;
@@ -73,7 +73,8 @@ export const DECOMPOSE_QUERY_TOOL = {
       subquestions: {
         type: 'array',
         items: { type: 'string' },
-        description: '3-5 sub-questions if decompose=true, otherwise empty array.',
+        maxItems: 3,
+        description: 'Up to 3 sub-questions if decompose=true, otherwise empty array.',
       },
     },
     required: ['decompose', 'subquestions'],

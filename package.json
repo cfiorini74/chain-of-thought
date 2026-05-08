@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test-agents": "tsx --env-file=.env.local scripts/test-agents.ts"
+    "test-agents": "tsx --env-file=.env.local scripts/test-agents.ts",
+    "test-orchestrator": "tsx scripts/test-orchestrator.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.95.0",

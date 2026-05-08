@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { tavilySearch } from '@/lib/tavily';
 import { runTextCall } from '@/lib/anthropic';
+import { MODELS } from '@/lib/models';
 import { SEARCH_SYNTHESIS_SYSTEM } from '@/lib/prompts';
 import type { SearchAgentRequest, SearchAgentResponse } from '@/lib/types';
 
@@ -18,7 +19,7 @@ export async function POST(request: NextRequest) {
       .join('\n\n');
 
     const findings = await runTextCall({
-      model: 'claude-sonnet-4-6',
+      model: MODELS.search,
       systemPrompt: SEARCH_SYNTHESIS_SYSTEM,
       userPrompt: `You are researching: ${body.query}\n\nSearch results:\n${numbered}`,
       maxTokens: 1500,

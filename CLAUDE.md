@@ -54,7 +54,7 @@ async function onRecompute(nodeId: string) {
 
 - Stateless server architecture. No SSE, sessions, or JSON snapshots.
 - Tool use for structured output (planner + rollup). No JSON-parse-from-prose.
-- Models: planner = `claude-haiku-4-5-20251001`, search synth = `claude-sonnet-4-6`, rollup = `claude-opus-4-7`.
+- Models (production — see `lib/models.ts`): planner = `claude-haiku-4-5-20251001`, search synth = `claude-sonnet-4-6`, rollup = `claude-opus-4-7`. In `next dev` all three collapse to Haiku 4.5 to keep iteration cheap; `NODE_ENV === 'production'` is the switch.
 - `pLimit(5)` concurrency cap.
 - Prompt caching (`cache_control: { type: 'ephemeral' }`) on system prompts.
 
