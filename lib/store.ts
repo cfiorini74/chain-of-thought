@@ -3,12 +3,16 @@ import type { ResearchNode, ResearchTree } from './types';
 
 interface TreeStoreState {
   tree: ResearchTree | null;
+  selectedNodeId: string | null;
+  reshapeOpInFlight: boolean;
 
   initTree: (rootQuery: string) => string;
   upsertNode: (node: ResearchNode) => void;
   updateNode: (id: string, partial: Partial<ResearchNode>) => void;
   deleteSubtree: (nodeId: string) => void;
   setSettled: () => void;
+  selectNode: (id: string | null) => void;
+  setReshapeOpInFlight: (val: boolean) => void;
   reset: () => void;
 }
 
@@ -38,6 +42,8 @@ export function createNode(parentId: string | null, query: string): ResearchNode
 
 export const useTreeStore = create<TreeStoreState>((set) => ({
   tree: null,
+  selectedNodeId: null,
+  reshapeOpInFlight: false,
 
   initTree(rootQuery) {
     const root = createNode(null, rootQuery);
@@ -124,7 +130,15 @@ export const useTreeStore = create<TreeStoreState>((set) => ({
     });
   },
 
+  selectNode(id) {
+    set({ selectedNodeId: id });
+  },
+
+  setReshapeOpInFlight(val) {
+    set({ reshapeOpInFlight: val });
+  },
+
   reset() {
-    set({ tree: null });
+    set({ tree: null, selectedNodeId: null, reshapeOpInFlight: false });
   },
 }));

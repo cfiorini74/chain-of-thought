@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { runToolCall } from '@/lib/anthropic';
+import { MODELS } from '@/lib/models';
 import { ROLLUP_SYSTEM, ROLLUP_TOOL } from '@/lib/prompts';
 import type {
   Claim,
@@ -50,7 +51,7 @@ export async function POST(request: NextRequest) {
     const userPrompt = `This node's own findings:\n${body.ownFindings}\n\nChild branches:\n${branchesText}`;
 
     const raw = await runToolCall<RawRollupResponse>({
-      model: 'claude-opus-4-7',
+      model: MODELS.rollup,
       systemPrompt: ROLLUP_SYSTEM,
       userPrompt,
       tool: ROLLUP_TOOL,

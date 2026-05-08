@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { runToolCall } from '@/lib/anthropic';
+import { MODELS } from '@/lib/models';
 import { PLANNER_SYSTEM, DECOMPOSE_QUERY_TOOL } from '@/lib/prompts';
 import type { PlanAgentRequest, PlanAgentResponse } from '@/lib/types';
 
@@ -18,7 +19,7 @@ export async function POST(request: NextRequest) {
     }
 
     const result = await runToolCall<PlanAgentResponse>({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODELS.plan,
       systemPrompt: PLANNER_SYSTEM,
       userPrompt: `Original query: ${body.rootQuery}\n\nSub-question just searched: ${body.query}\n\nFindings: ${body.findings}`,
       tool: DECOMPOSE_QUERY_TOOL,
