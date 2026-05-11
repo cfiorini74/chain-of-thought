@@ -152,6 +152,8 @@ export async function summarizeSubtree(
   const walk = (id: string) => {
     const n = useTreeStore.getState().tree?.nodes[id];
     if (!n) return;
+    // Clean subtrees stay clean by invariant — staleness only propagates upward.
+    if (!n.rollupStale && n.pendingExclusions.length === 0) return;
     for (const cid of n.childIds) walk(cid);
     postOrder.push(id);
   };

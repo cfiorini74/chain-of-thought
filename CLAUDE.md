@@ -1,6 +1,6 @@
 @AGENTS.md
 
-# Research Tree project
+# Chain of Thought project
 
 Tech demo for an FDE interview at an LLM/agent company. Pre-recorded ~15-min video. Pitch: structured **claims** with branch attribution; contradictions are claims with `opposing.length > 0`; claims compose upward through the tree by union.
 Users will also be able to play around with the final product.

@@ -6,7 +6,6 @@ import { callPlanAgent } from '@/lib/agents';
 import {
   expandNode,
   isAbortError,
-  markChainStale,
   MAX_TOTAL_NODES,
   resetAndRebuild,
   summarizeSubtree,
@@ -455,7 +454,6 @@ export default function SidePanel() {
     }
     useTreeStore.getState().deleteSubtree(node.id);
     useTreeStore.getState().selectNode(parentId);
-    markChainStale(parentId);
   }
 
   // === Expand ===

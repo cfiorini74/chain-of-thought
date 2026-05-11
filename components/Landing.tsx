@@ -22,7 +22,7 @@ export default function Landing({ onSubmit }: LandingProps) {
     <div className="flex flex-1 items-center justify-center px-6">
       <main className="flex w-full max-w-xl flex-col items-center gap-6">
         <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-          Research Tree
+          Chain of Thought
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-400">
           Ask a question. We&apos;ll search the web; you&apos;ll branch and

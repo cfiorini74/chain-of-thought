@@ -400,6 +400,8 @@ async function test_abortError_rollup_marksDoneStale() {
   const childARollup = useTreeStore.getState().tree!.nodes[childA].rollup;
   mock.rollupAborts.add(childARollup);
 
+  // Dirty the root so the prune walker actually visits it.
+  markChainStale(rootId);
   await summarizeSubtree(rootId);
 
   const root = useTreeStore.getState().tree!.nodes[rootId];

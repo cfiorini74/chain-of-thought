@@ -153,6 +153,18 @@ export const useTreeStore = create<TreeStoreState>((set) => ({
           childIds: newNodes[target.parentId].childIds.filter((cid) => cid !== nodeId),
           updatedAt: Date.now(),
         };
+
+        // Removing a child changes the parent's rollup inputs, so the
+        // parent (and every ancestor) needs Summarize to refresh.
+        let curId: string | null = target.parentId;
+        while (curId !== null) {
+          const anc: ResearchNode | undefined = newNodes[curId];
+          if (!anc) break;
+          if (!anc.rollupStale) {
+            newNodes[curId] = { ...anc, rollupStale: true };
+          }
+          curId = anc.parentId;
+        }
       }
 
       // Sweep pendingExclusions on every remaining node, dropping refs to
