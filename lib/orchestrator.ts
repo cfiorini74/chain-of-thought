@@ -128,6 +128,7 @@ export async function expandNode(
 
   markChainStale(nodeId);
 
+  const subquestions = plan.subquestions.slice(0, MAX_CHILDREN_PER_NODE);
   const childIds: string[] = [];
   for (const sq of subs) {
     const child = createNode(nodeId, sq);
@@ -304,4 +305,69 @@ export async function resetAndRebuild(
   if (parentId) markChainStale(parentId);
 
   await buildNode(nodeId, signal);
+}
+
+export async function resetAndRebuild(
+  nodeId: string,
+  newQuery: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const tree = useTreeStore.getState().tree;
+  if (!tree) return;
+  const node = tree.nodes[nodeId];
+  if (!node) return;
+
+  const childIdsSnapshot = [...node.childIds];
+  for (const childId of childIdsSnapshot) {
+    useTreeStore.getState().deleteSubtree(childId);
+  }
+
+  useTreeStore.getState().updateNode(nodeId, {
+    query: newQuery,
+    status: 'pending',
+    searchResults: [],
+    findings: '',
+    findingsEdited: false,
+    rollup: '',
+    claims: [],
+    rollupStale: false,
+    rollupIncomplete: false,
+    error: null,
+  });
+
+  const depth = getNodeDepth(nodeId);
+  await buildNode(nodeId, signal, depth, MAX_INITIAL_DEPTH);
+
+  const parentId = useTreeStore.getState().tree?.nodes[nodeId]?.parentId ?? null;
+  if (parentId) {
+    await recomputeChain(parentId, signal);
+  }
+}
+
+export async function deepenNode(
+  nodeId: string,
+  customSubquestions: string[],
+  signal?: AbortSignal
+): Promise<void> {
+  const tree = useTreeStore.getState().tree;
+  if (!tree) return;
+  const node = tree.nodes[nodeId];
+  if (!node) return;
+  if (customSubquestions.length === 0) return;
+
+  const currentDepth = getNodeDepth(nodeId);
+  const childMaxDepth = currentDepth + DEEPEN_EXTRA_DEPTH;
+
+  const childIds: string[] = [];
+  for (const sq of customSubquestions) {
+    const child = createNode(nodeId, sq);
+    useTreeStore.getState().upsertNode(child);
+    childIds.push(child.id);
+  }
+
+  await Promise.allSettled(
+    childIds.map((id) => buildNode(id, signal, currentDepth + 1, childMaxDepth))
+  );
+
+  await recomputeChain(nodeId, signal);
 }
