@@ -5,10 +5,7 @@ export const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY!,
 });
 
-export type Model =
-  | 'claude-haiku-4-5-20251001'
-  | 'claude-sonnet-4-6'
-  | 'claude-opus-4-7';
+export type Model = 'claude-haiku-4-5-20251001';
 
 interface ToolCallOptions {
   model: Model;

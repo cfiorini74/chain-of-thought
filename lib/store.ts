@@ -1,19 +1,54 @@
 import { create } from 'zustand';
+import { normalizeStatement } from './claims';
 import type { ResearchNode, ResearchTree } from './types';
 
 interface TreeStoreState {
   tree: ResearchTree | null;
   selectedNodeId: string | null;
-  reshapeOpInFlight: boolean;
+  // Keyed by the originating node of each reshape op. See isNodeBusy for gating.
+  inFlightOps: Record<string, AbortController>;
 
   initTree: (rootQuery: string) => string;
   upsertNode: (node: ResearchNode) => void;
   updateNode: (id: string, partial: Partial<ResearchNode>) => void;
   deleteSubtree: (nodeId: string) => void;
+  toggleClaimExclusion: (nodeId: string, statement: string) => void;
   setSettled: () => void;
   selectNode: (id: string | null) => void;
-  setReshapeOpInFlight: (val: boolean) => void;
+  startOp: (originId: string, controller: AbortController) => void;
+  endOp: (originId: string) => void;
   reset: () => void;
+}
+
+// Busy iff some in-flight origin sits on the same root-to-leaf path as
+// nodeId. Disjoint subtrees can run reshape ops concurrently.
+export function isNodeBusy(
+  nodeId: string,
+  tree: ResearchTree | null,
+  inFlightOps: Record<string, AbortController>
+): boolean {
+  if (!tree) return false;
+  const origins = Object.keys(inFlightOps);
+  if (origins.length === 0) return false;
+  for (const originId of origins) {
+    if (originId === nodeId) return true;
+    if (isAncestor(originId, nodeId, tree)) return true;
+    if (isAncestor(nodeId, originId, tree)) return true;
+  }
+  return false;
+}
+
+function isAncestor(
+  ancestorId: string,
+  descendantId: string,
+  tree: ResearchTree
+): boolean {
+  let cur: string | null = tree.nodes[descendantId]?.parentId ?? null;
+  while (cur) {
+    if (cur === ancestorId) return true;
+    cur = tree.nodes[cur]?.parentId ?? null;
+  }
+  return false;
 }
 
 let nodeCounter = 0;
@@ -28,11 +63,12 @@ export function createNode(parentId: string | null, query: string): ResearchNode
     status: 'pending',
     searchResults: [],
     findings: '',
-    findingsEdited: false,
     rollup: '',
     claims: [],
     rollupStale: false,
     rollupIncomplete: false,
+    excludedStatements: [],
+    pendingExclusions: [],
     childIds: [],
     error: null,
     createdAt: now,
@@ -43,7 +79,7 @@ export function createNode(parentId: string | null, query: string): ResearchNode
 export const useTreeStore = create<TreeStoreState>((set) => ({
   tree: null,
   selectedNodeId: null,
-  reshapeOpInFlight: false,
+  inFlightOps: {},
 
   initTree(rootQuery) {
     const root = createNode(null, rootQuery);
@@ -119,6 +155,78 @@ export const useTreeStore = create<TreeStoreState>((set) => ({
         };
       }
 
+      // Sweep pendingExclusions on every remaining node, dropping refs to
+      // any deleted source. Without this, ancestors retain dangling refs
+      // that can never be cleared by Summarize or un-X.
+      for (const id of Object.keys(newNodes)) {
+        const n = newNodes[id];
+        const cleaned = n.pendingExclusions.filter(
+          (e) => !toDelete.has(e.sourceId)
+        );
+        if (cleaned.length !== n.pendingExclusions.length) {
+          newNodes[id] = { ...n, pendingExclusions: cleaned };
+        }
+      }
+
+      return { tree: { ...state.tree, nodes: newNodes } };
+    });
+  },
+
+  toggleClaimExclusion(nodeId, statement) {
+    set((state) => {
+      if (!state.tree) return state;
+      const node = state.tree.nodes[nodeId];
+      if (!node) return state;
+      const norm = normalizeStatement(statement);
+      if (!norm) return state;
+
+      const wasExcluded = node.excludedStatements.includes(norm);
+      const newExcluded = wasExcluded
+        ? node.excludedStatements.filter((s) => s !== norm)
+        : [...node.excludedStatements, norm];
+
+      const newNodes = { ...state.tree.nodes };
+      newNodes[nodeId] = {
+        ...node,
+        excludedStatements: newExcluded,
+        updatedAt: Date.now(),
+      };
+
+      // Walk ancestors and update pendingExclusions symmetrically.
+      // Add-then-remove (before any Summarize) cancels out cleanly.
+      let curId = node.parentId;
+      while (curId) {
+        const anc = newNodes[curId];
+        if (!anc) break;
+        const existingIdx = anc.pendingExclusions.findIndex(
+          (e) => e.sourceId === nodeId && e.statement === norm
+        );
+        let nextPending: typeof anc.pendingExclusions;
+        if (wasExcluded) {
+          // Un-excluding: remove the pending entry if present.
+          if (existingIdx === -1) {
+            curId = anc.parentId;
+            continue;
+          }
+          nextPending = [
+            ...anc.pendingExclusions.slice(0, existingIdx),
+            ...anc.pendingExclusions.slice(existingIdx + 1),
+          ];
+        } else {
+          // Excluding: add a pending entry (idempotent — skip if already there).
+          if (existingIdx !== -1) {
+            curId = anc.parentId;
+            continue;
+          }
+          nextPending = [
+            ...anc.pendingExclusions,
+            { sourceId: nodeId, statement: norm },
+          ];
+        }
+        newNodes[curId] = { ...anc, pendingExclusions: nextPending };
+        curId = anc.parentId;
+      }
+
       return { tree: { ...state.tree, nodes: newNodes } };
     });
   },
@@ -134,11 +242,27 @@ export const useTreeStore = create<TreeStoreState>((set) => ({
     set({ selectedNodeId: id });
   },
 
-  setReshapeOpInFlight(val) {
-    set({ reshapeOpInFlight: val });
+  startOp(originId, controller) {
+    set((state) => ({
+      inFlightOps: { ...state.inFlightOps, [originId]: controller },
+    }));
+  },
+
+  endOp(originId) {
+    set((state) => {
+      if (!(originId in state.inFlightOps)) return state;
+      const next = { ...state.inFlightOps };
+      delete next[originId];
+      return { inFlightOps: next };
+    });
   },
 
   reset() {
-    set({ tree: null, selectedNodeId: null, reshapeOpInFlight: false });
+    set((state) => {
+      for (const c of Object.values(state.inFlightOps)) {
+        c.abort();
+      }
+      return { tree: null, selectedNodeId: null, inFlightOps: {} };
+    });
   },
 }));

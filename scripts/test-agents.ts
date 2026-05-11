@@ -19,7 +19,7 @@ async function searchAgent(query: string) {
     .map((r, i) => `[${i + 1}] ${r.title} (${r.url})\n${r.content.slice(0, 4000)}`)
     .join('\n\n');
   const findings = await runTextCall({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-haiku-4-5-20251001',
     systemPrompt: SEARCH_SYNTHESIS_SYSTEM,
     userPrompt: `You are researching: ${query}\n\nSearch results:\n${numbered}`,
     maxTokens: 2500,
@@ -68,7 +68,7 @@ async function rollupAgent(
     .join('\n\n');
 
   const raw = await runToolCall<{ summary: string; claims: RawClaim[] }>({
-    model: 'claude-opus-4-7',
+    model: 'claude-haiku-4-5-20251001',
     systemPrompt: ROLLUP_SYSTEM,
     userPrompt: `This node's own findings:\n${ownFindings}\n\nChild branches:\n${branchesText}`,
     tool: ROLLUP_TOOL,
@@ -80,6 +80,7 @@ async function rollupAgent(
     statement: c.statement,
     supporting: c.supporting.map((s) => translate(s, indexToChildId)),
     opposing: c.opposing.map((s) => translate(s, indexToChildId)),
+    originNodeIds: [],
   }));
 
   console.log(

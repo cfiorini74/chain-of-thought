@@ -44,8 +44,6 @@ Tree state lives in the client; server endpoints are thin proxies. No SSE, no se
 
 ## Models
 
-- Planner: `claude-haiku-4-5-20251001` (fast, cheap, structured output via tool use)
-- Search synthesis: `claude-sonnet-4-6` (long-form quality with citations)
-- Rollup: `claude-opus-4-7` (reasoning-heavy disagreement detection)
+All three agents use `claude-haiku-4-5-20251001` (fast, cheap, structured output via tool use).
 
 System prompts are cached via `cache_control: { type: 'ephemeral' }` to amortize cost across the ~30 calls per research session.

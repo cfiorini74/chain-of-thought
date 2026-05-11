@@ -4,8 +4,7 @@ export type NodeStatus =
   | 'synthesizing'
   | 'rolling-up'
   | 'done'
-  | 'error'
-  | 'depth-limit';
+  | 'error';
 
 export interface SearchResult {
   url: string;
@@ -16,6 +15,10 @@ export interface SearchResult {
 export interface ClaimSource {
   childId: string | null;
   quote?: string;
+  // 1-indexed citations into the OWNER node's searchResults when childId is
+  // null (own findings). When childId !== null, these reference the CHILD's
+  // sources and are only meaningful via origin-node navigation.
+  sourceIndices?: number[];
 }
 
 export interface Claim {
@@ -23,6 +26,9 @@ export interface Claim {
   statement: string;
   supporting: ClaimSource[];
   opposing: ClaimSource[];
+  // Node IDs where this claim ultimately originates. Computed by walking
+  // mergedFromIds through child claims at rollup time.
+  originNodeIds: string[];
 }
 
 export interface ResearchNode {
@@ -32,15 +38,25 @@ export interface ResearchNode {
   status: NodeStatus;
   searchResults: SearchResult[];
   findings: string;
-  findingsEdited: boolean;
   rollup: string;
   claims: Claim[];
   rollupStale: boolean;
   rollupIncomplete: boolean;
+  // Normalized (lowercase + trimmed) claim statements the user has X'd off.
+  // Filtered out when this node's claims feed into a parent's rollup.
+  excludedStatements: string[];
+  // Per-claim refs for exclusions in the subtree that haven't been applied
+  // by a Summarize at this level. Purely for symmetric stale-tracking.
+  pendingExclusions: PendingExclusion[];
   childIds: string[];
   error: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface PendingExclusion {
+  sourceId: string;
+  statement: string; // normalized
 }
 
 export interface ResearchTree {
@@ -79,6 +95,7 @@ export interface RollupAgentResponse {
 export interface RawClaimSource {
   branchIndex: number;
   quote?: string;
+  sourceIndices?: number[];
 }
 
 export interface RawClaim {
@@ -86,4 +103,5 @@ export interface RawClaim {
   statement: string;
   supporting: RawClaimSource[];
   opposing: RawClaimSource[];
+  mergedFromIds: string[];
 }

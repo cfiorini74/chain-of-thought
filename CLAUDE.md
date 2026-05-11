@@ -3,6 +3,7 @@
 # Research Tree project
 
 Tech demo for an FDE interview at an LLM/agent company. Pre-recorded ~15-min video. Pitch: structured **claims** with branch attribution; contradictions are claims with `opposing.length > 0`; claims compose upward through the tree by union.
+Users will also be able to play around with the final product.
 
 ## Source of truth
 
@@ -15,7 +16,7 @@ Phase 1 (Backbone) and Phase 2 (client orchestrator) are **done**. `pnpm build` 
 
 - Three stateless agent endpoints work: `app/api/agents/{search,plan,rollup}/route.ts`.
 - Data model is **`Claim`** (not Contradiction). See `lib/types.ts`. Claims compose upward; merging happens in the rollup endpoint.
-- Client orchestrator: `lib/orchestrator.ts` exposes `buildInitialTree`, `buildNode`, `markChainStale`, `recomputeChain`.
+- Client orchestrator: `lib/orchestrator.ts` exposes `buildInitialTree` (root only — no auto-decompose), `buildNode`, `expandNode` (one-layer planner-driven children), `summarizeSubtree` (manual post-order rollup), `resetAndRebuild`, `markChainStale`. `MAX_TOTAL_NODES = 20`.
 - Zustand store: `lib/store.ts`. Use `useTreeStore` for selectors and actions.
 - CLI verification: `pnpm test-agents` (requires `.env.local` with `ANTHROPIC_API_KEY` and `TAVILY_API_KEY`).
 - Phase 3 (eval set) and Phase 4+ (frontend) are **not started**.
@@ -26,7 +27,7 @@ Phase 1 (Backbone) and Phase 2 (client orchestrator) are **done**. `pnpm build` 
 - Tree state: `useTreeStore((s) => s.tree)`. Single source of truth. No SSE, no server state.
 - Edit-findings is **disabled** until `tree.initialBuildSettled === true`.
 - Cancellation: pass an `AbortSignal` to orchestrator calls. `AbortError` is treated as user-initiated cancellation; the orchestrator does NOT flip node status to `error` on abort.
-- Reshape flow (Option 3): initial build is auto, all reshape ops (deepen, manual-add-child, delete) are user-confirmed.
+- Reshape flow: initial build is root-only; all branching and all rollups are user-triggered. Expand (planner-suggested children, one layer at a time), Summarize (post-order rollup of a subtree), Delete are user-confirmed.
 - Claim rendering: `node.claims[]`. A claim is "contradicted" if `opposing.length > 0`. Filter for these to show the contradicted-claims list with branch attribution.
 - Citation parser: `findings` text contains `[1]`, `[2]` markers; parse and link to `node.searchResults[n-1]`. Test with edited findings (user might break markers).
 - Status state machine for NodeCard pulse: `pending` → `searching` → `synthesizing` → `rolling-up` → `done` (or `error`).
@@ -35,18 +36,23 @@ Pattern:
 ```tsx
 'use client';
 import { useTreeStore } from '@/lib/store';
-import { buildInitialTree, recomputeChain, markChainStale } from '@/lib/orchestrator';
+import { buildInitialTree, expandNode, summarizeSubtree } from '@/lib/orchestrator';
 
 const tree = useTreeStore((s) => s.tree);
 
 async function onSubmit(query: string) {
   const controller = new AbortController();
-  await buildInitialTree(query, controller.signal);
+  await buildInitialTree(query, controller.signal); // root only
 }
 
-async function onRecompute(nodeId: string) {
-  markChainStale(nodeId);
-  await recomputeChain(nodeId, controller.signal);
+async function onExpand(nodeId: string, subquestions: string[]) {
+  const controller = new AbortController();
+  await expandNode(nodeId, subquestions, controller.signal); // one layer
+}
+
+async function onSummarize(nodeId: string) {
+  const controller = new AbortController();
+  await summarizeSubtree(nodeId, controller.signal); // post-order rollup
 }
 ```
 
@@ -54,7 +60,7 @@ async function onRecompute(nodeId: string) {
 
 - Stateless server architecture. No SSE, sessions, or JSON snapshots.
 - Tool use for structured output (planner + rollup). No JSON-parse-from-prose.
-- Models (production — see `lib/models.ts`): planner = `claude-haiku-4-5-20251001`, search synth = `claude-sonnet-4-6`, rollup = `claude-opus-4-7`. In `next dev` all three collapse to Haiku 4.5 to keep iteration cheap; `NODE_ENV === 'production'` is the switch.
+- Models (see `lib/models.ts`): all three agents use `claude-haiku-4-5-20251001`. Previously prod used Sonnet for search synth and Opus for rollup with a `NODE_ENV` switch; collapsed to Haiku-everywhere for cost.
 - `pLimit(5)` concurrency cap.
 - Prompt caching (`cache_control: { type: 'ephemeral' }`) on system prompts.
 

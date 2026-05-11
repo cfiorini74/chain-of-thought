@@ -25,7 +25,8 @@ export default function Landing({ onSubmit }: LandingProps) {
           Research Tree
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-400">
-          Ask a question. We&apos;ll search, decompose, and roll up structured claims.
+          Ask a question. We&apos;ll search the web; you&apos;ll branch and
+          summarize.
         </p>
         <form onSubmit={handleSubmit} className="flex w-full flex-col gap-3">
           <textarea
