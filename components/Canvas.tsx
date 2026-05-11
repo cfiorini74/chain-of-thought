@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react';
 import { useTreeStore } from '@/lib/store';
+import { MAX_TOTAL_NODES } from '@/lib/orchestrator';
 import ResearchGraph from './ResearchGraph';
 import SidePanel from './SidePanel';
 
@@ -27,13 +28,17 @@ export default function Canvas({ onNewQuery }: CanvasProps) {
   if (!tree || !rootId) return null;
 
   const rootQuery = tree.nodes[rootId]?.query ?? '';
+  const nodeCount = Object.keys(tree.nodes).length;
 
   return (
     <div className="flex h-full w-full min-h-0 flex-1 flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-        <h1 className="truncate text-base font-semibold text-zinc-900 dark:text-zinc-100">
+      <header className="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
+        <h1 className="min-w-0 flex-1 truncate text-base font-semibold text-zinc-900 dark:text-zinc-100">
           {rootQuery}
         </h1>
+        <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">
+          {nodeCount} / {MAX_TOTAL_NODES} nodes
+        </span>
         <button
           type="button"
           onClick={onNewQuery}

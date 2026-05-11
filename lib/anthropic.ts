@@ -1,14 +1,12 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { acquireAnthropicSlot } from './rate-limit';
 import { withRetry } from './retry';
 
 export const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY!,
 });
 
-export type Model =
-  | 'claude-haiku-4-5-20251001'
-  | 'claude-sonnet-4-6'
-  | 'claude-opus-4-7';
+export type Model = 'claude-haiku-4-5-20251001';
 
 interface ToolCallOptions {
   model: Model;
@@ -27,6 +25,7 @@ export async function runToolCall<T>(opts: ToolCallOptions): Promise<T> {
   const { model, systemPrompt, userPrompt, tool, maxTokens = 2048, signal } = opts;
 
   return withRetry(async () => {
+    await acquireAnthropicSlot(signal);
     const response = await anthropic.messages.create(
       {
         model,
@@ -73,6 +72,7 @@ export async function runTextCall(opts: TextCallOptions): Promise<string> {
   const { model, systemPrompt, userPrompt, maxTokens = 2048, signal } = opts;
 
   return withRetry(async () => {
+    await acquireAnthropicSlot(signal);
     const response = await anthropic.messages.create(
       {
         model,

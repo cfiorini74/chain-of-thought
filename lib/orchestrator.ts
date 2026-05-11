@@ -1,62 +1,41 @@
 import pLimit from 'p-limit';
-import { callPlanAgent, callRollupAgent, callSearchAgent } from './agents';
+import { callRollupAgent, callSearchAgent } from './agents';
+import { normalizeStatement } from './claims';
 import { createNode, useTreeStore } from './store';
-import type { ResearchNode } from './types';
+import type { Claim, ResearchNode } from './types';
 
 const llmLimit = pLimit(5);
-const MAX_CHILDREN_PER_NODE = 3;
-const MAX_INITIAL_DEPTH = 2;
-const DEEPEN_EXTRA_DEPTH = 3;
+export const MAX_TOTAL_NODES = 20;
 
-function isAbortError(err: unknown): boolean {
+export function isAbortError(err: unknown): boolean {
   return (err as { name?: string })?.name === 'AbortError';
 }
 
-function getNodeDepth(nodeId: string): number {
+// Origin should be the deepest node(s) where the claim first appeared, not
+// every level it bubbled through — so only stamp this node when the route
+// resolved no origin at all.
+function attachOwnOrigin(claims: Claim[], nodeId: string): Claim[] {
+  return claims.map((c) =>
+    c.originNodeIds.length > 0 ? c : { ...c, originNodeIds: [nodeId] }
+  );
+}
+
+export function getRemainingNodeCapacity(): number {
   const tree = useTreeStore.getState().tree;
-  if (!tree) return 0;
-  let depth = 0;
-  let cur = tree.nodes[nodeId];
-  while (cur?.parentId) {
-    depth++;
-    cur = tree.nodes[cur.parentId];
-  }
-  return depth;
+  if (!tree) return MAX_TOTAL_NODES;
+  return Math.max(0, MAX_TOTAL_NODES - Object.keys(tree.nodes).length);
 }
 
-export async function buildInitialTree(
-  rootQuery: string,
-  signal?: AbortSignal
-): Promise<string> {
-  const store = useTreeStore.getState();
-  const rootId = store.initTree(rootQuery);
-  try {
-    await buildNode(rootId, signal, 0);
-  } finally {
-    // Guard against the race where this build was aborted+replaced: only flip
-    // settled if the current tree is still the one we created.
-    const currentTree = useTreeStore.getState().tree;
-    if (currentTree?.rootId === rootId) {
-      useTreeStore.getState().setSettled();
-    }
-  }
-  return rootId;
-}
-
+// Single-node research: search → synthesize → extract own claims → done.
+// Own-claim extraction runs the rollup agent with an empty children array so
+// every node has structured claims from its own findings without needing
+// Summarize. Summarize is reserved for folding children's claims upward.
 export async function buildNode(
   nodeId: string,
-  signal?: AbortSignal,
-  depth = 0,
-  maxDepth = MAX_INITIAL_DEPTH
+  signal?: AbortSignal
 ): Promise<void> {
-  const initialTree = useTreeStore.getState().tree;
-  const node = initialTree?.nodes[nodeId];
+  const node = useTreeStore.getState().tree?.nodes[nodeId];
   if (!node) return;
-
-  const rootQuery =
-    useTreeStore.getState().tree?.nodes[
-      useTreeStore.getState().tree!.rootId
-    ]?.query ?? node.query;
 
   useTreeStore.getState().updateNode(nodeId, { status: 'searching' });
 
@@ -76,28 +55,29 @@ export async function buildNode(
   }
 
   useTreeStore.getState().updateNode(nodeId, {
-    status: 'synthesizing',
+    status: 'rolling-up',
     searchResults: searchResult.results,
     findings: searchResult.findings,
   });
 
-  if (depth >= maxDepth) {
-    useTreeStore.getState().updateNode(nodeId, {
-      status: 'depth-limit',
-      rollup: searchResult.findings,
-      claims: [],
-    });
-    return;
-  }
-
-  let plan;
   try {
-    plan = await llmLimit(() =>
-      callPlanAgent(node.query, searchResult.findings, rootQuery, signal)
+    const rollup = await llmLimit(() =>
+      callRollupAgent(searchResult.findings, [], signal)
     );
+    useTreeStore.getState().updateNode(nodeId, {
+      status: 'done',
+      rollup: rollup.summary || searchResult.findings,
+      claims: attachOwnOrigin(rollup.claims, nodeId),
+      rollupStale: false,
+      rollupIncomplete: false,
+    });
   } catch (err) {
     if (isAbortError(err)) {
-      useTreeStore.getState().updateNode(nodeId, { status: 'pending' });
+      // Findings are intact; mark stale so a later Summarize can fill claims.
+      useTreeStore.getState().updateNode(nodeId, {
+        status: 'done',
+        rollupStale: true,
+      });
       return;
     }
     useTreeStore.getState().updateNode(nodeId, {
@@ -106,74 +86,157 @@ export async function buildNode(
     });
     throw err;
   }
+}
 
-  if (!plan.decompose || plan.subquestions.length === 0) {
-    useTreeStore.getState().updateNode(nodeId, {
-      status: 'done',
-      rollup: searchResult.findings,
-      claims: [],
-    });
-    return;
+export async function buildInitialTree(
+  rootQuery: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const rootId = useTreeStore.getState().initTree(rootQuery);
+  try {
+    await buildNode(rootId, signal);
+  } finally {
+    // Guard against the race where this build was aborted+replaced: only flip
+    // settled if the current tree is still the one we created.
+    const currentTree = useTreeStore.getState().tree;
+    if (currentTree?.rootId === rootId) {
+      useTreeStore.getState().setSettled();
+    }
   }
+  return rootId;
+}
 
-  const subquestions = plan.subquestions.slice(0, MAX_CHILDREN_PER_NODE);
+// Add one layer of children to nodeId, then build each. Caller supplies
+// subquestions (typically planner-suggested + user-edited). Truncates to the
+// remaining global capacity. Marks ancestor rollups stale.
+export async function expandNode(
+  nodeId: string,
+  customSubquestions: string[],
+  signal?: AbortSignal
+): Promise<void> {
+  const tree = useTreeStore.getState().tree;
+  if (!tree) return;
+  const node = tree.nodes[nodeId];
+  if (!node) return;
+
+  const filtered = customSubquestions.map((s) => s.trim()).filter(Boolean);
+  if (filtered.length === 0) return;
+
+  const remaining = MAX_TOTAL_NODES - Object.keys(tree.nodes).length;
+  if (remaining <= 0) return;
+  const subs = filtered.slice(0, remaining);
+
+  markChainStale(nodeId);
+
   const childIds: string[] = [];
-  for (const sq of subquestions) {
+  for (const sq of subs) {
     const child = createNode(nodeId, sq);
     useTreeStore.getState().upsertNode(child);
     childIds.push(child.id);
   }
 
-  await Promise.allSettled(
-    childIds.map((id) => buildNode(id, signal, depth + 1, maxDepth))
-  );
+  await Promise.allSettled(childIds.map((id) => buildNode(id, signal)));
+}
 
-  useTreeStore.getState().updateNode(nodeId, { status: 'rolling-up' });
-
+// Walks the subtree rooted at nodeId in post-order. Leaves keep their build-
+// time own-claims unchanged; only internal nodes re-roll, merging current
+// children's (exclusion-filtered) claims into the parent.
+export async function summarizeSubtree(
+  nodeId: string,
+  signal?: AbortSignal
+): Promise<void> {
   const tree = useTreeStore.getState().tree;
-  // someFailed counts any child not in a settled-leaf state. This catches
-  // explicit errors (status === 'error'), abort restorations (status === 'pending'),
-  // and any weird in-flight residue. Without this, aborted children silently
-  // get excluded from the rollup but the parent looks "clean".
-  const someFailed = childIds.some((id) => {
-    const c = tree?.nodes[id];
-    return !c || (c.status !== 'done' && c.status !== 'depth-limit');
+  if (!tree?.nodes[nodeId]) return;
+
+  const postOrder: string[] = [];
+  const walk = (id: string) => {
+    const n = useTreeStore.getState().tree?.nodes[id];
+    if (!n) return;
+    // Clean subtrees stay clean by invariant — staleness only propagates upward.
+    if (!n.rollupStale && n.pendingExclusions.length === 0) return;
+    for (const cid of n.childIds) walk(cid);
+    postOrder.push(id);
+  };
+  walk(nodeId);
+
+  for (const id of postOrder) {
+    if (signal?.aborted) return;
+    await summarizeNode(id, signal);
+  }
+}
+
+async function summarizeNode(
+  nodeId: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const tree = useTreeStore.getState().tree;
+  if (!tree) return;
+  const node = tree.nodes[nodeId];
+  if (!node || node.status === 'error') return;
+  // Happy-path leaves are immutable under Summarize — own-claims came from
+  // build. But a stale or zero-claim leaf has nowhere else to recover from
+  // (Summarize button is the only retry surface for leaves), so let those
+  // through to re-run extraction with empty children.
+  if (
+    node.childIds.length === 0 &&
+    !node.rollupStale &&
+    node.claims.length > 0
+  ) {
+    return;
+  }
+  if (node.status !== 'done' && node.status !== 'rolling-up') return;
+
+  useTreeStore.getState().updateNode(nodeId, {
+    status: 'rolling-up',
+    rollupStale: false,
   });
-  const survivors = childIds
-    .map((id) => tree?.nodes[id])
+
+  const children = node.childIds
+    .map((id) => tree.nodes[id])
     .filter(
       (c): c is ResearchNode =>
         !!c && c.status !== 'error' && c.rollup.length > 0
     );
 
-  if (survivors.length === 0) {
-    useTreeStore.getState().updateNode(nodeId, {
-      status: someFailed ? 'error' : 'done',
-      rollup: searchResult.findings,
-      claims: [],
-      rollupIncomplete: someFailed,
-      error: someFailed ? 'all children failed' : null,
-    });
-    return;
-  }
-
   try {
-    const rollup = await llmLimit(() =>
+    const result = await llmLimit(() =>
       callRollupAgent(
-        searchResult.findings,
-        survivors.map((c) => ({
+        node.findings,
+        children.map((c) => ({
           childId: c.id,
           summary: c.rollup,
-          claims: c.claims,
+          // Drop X'd claims before they flow up — that's the whole point of
+          // the exclusion mechanic. Match by normalized statement.
+          claims: c.claims.filter(
+            (cl) =>
+              !c.excludedStatements.includes(normalizeStatement(cl.statement))
+          ),
         })),
         signal
       )
     );
+
+    const rollupIncomplete = node.childIds.some((cid) => {
+      const c = tree.nodes[cid];
+      if (!c) return true;
+      if (c.rollupIncomplete) return true;
+      return c.status !== 'done';
+    });
+
+    const merged = result.summary || node.findings;
     useTreeStore.getState().updateNode(nodeId, {
       status: 'done',
-      rollup: rollup.summary,
-      claims: rollup.claims,
-      rollupIncomplete: someFailed,
+      // Update findings as well so the Findings section reflects the merged
+      // content after Summarize. The next Summarize will feed this back as
+      // input, which is acceptable — the structured claims still come from
+      // children's claim arrays, not the prose.
+      findings: merged,
+      rollup: merged,
+      claims: attachOwnOrigin(result.claims, nodeId),
+      rollupIncomplete,
+      // This Summarize has now accounted for all exclusions in the subtree
+      // up to this point — clear the pending-tracking.
+      pendingExclusions: [],
     });
   } catch (err) {
     if (isAbortError(err)) {
@@ -197,95 +260,11 @@ export function markChainStale(startNodeId: string): void {
   if (!tree) return;
 
   let currentId: string | null = startNodeId;
-  while (currentId) {
-    store.updateNode(currentId, { rollupStale: true });
-    currentId = tree.nodes[currentId]?.parentId ?? null;
-  }
-}
-
-export async function recomputeChain(
-  startNodeId: string,
-  signal?: AbortSignal
-): Promise<void> {
-  const initialStore = useTreeStore.getState();
-  const initialTree = initialStore.tree;
-  if (!initialTree) return;
-
-  const chain: string[] = [];
-  let currentId: string | null = startNodeId;
-  while (currentId) {
-    const node: ResearchNode | undefined = initialTree.nodes[currentId];
-    if (!node) break;
-    chain.push(currentId);
-    currentId = node.parentId;
-  }
-
-  for (const nodeId of chain) {
-    const tree = useTreeStore.getState().tree;
-    if (!tree) return;
-    const node = tree.nodes[nodeId];
-    if (!node) continue;
-
-    // depth-limit nodes are treated as leaves for recompute purposes
-    if (node.childIds.length === 0 || node.status === 'depth-limit') {
-      useTreeStore.getState().updateNode(nodeId, {
-        rollup: node.findings,
-        claims: [],
-        rollupStale: false,
-        rollupIncomplete: false,
-      });
-      continue;
-    }
-
-    useTreeStore.getState().updateNode(nodeId, {
-      status: 'rolling-up',
-      rollupStale: false,
-    });
-
-    const children = node.childIds
-      .map((id) => tree.nodes[id])
-      .filter((c): c is ResearchNode => !!c && c.rollup.length > 0);
-
-    try {
-      const result = await llmLimit(() =>
-        callRollupAgent(
-          node.findings,
-          children.map((c) => ({
-            childId: c.id,
-            summary: c.rollup,
-            claims: c.claims,
-          })),
-          signal
-        )
-      );
-
-      const rollupIncomplete = node.childIds.some((cid) => {
-        const c = tree.nodes[cid];
-        if (!c) return true;
-        if (c.rollupIncomplete) return true;
-        return c.status !== 'done' && c.status !== 'depth-limit';
-      });
-
-      useTreeStore.getState().updateNode(nodeId, {
-        status: 'done',
-        rollup: result.summary,
-        claims: result.claims,
-        rollupIncomplete,
-      });
-    } catch (err) {
-      if (isAbortError(err)) {
-        useTreeStore.getState().updateNode(nodeId, {
-          status: 'done',
-          rollupStale: true,
-        });
-        return;
-      }
-      useTreeStore.getState().updateNode(nodeId, {
-        status: 'error',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
-    }
+  while (currentId !== null) {
+    const n: ResearchNode | undefined = tree.nodes[currentId];
+    if (!n) break;
+    if (!n.rollupStale) store.updateNode(currentId, { rollupStale: true });
+    currentId = n.parentId;
   }
 }
 
@@ -309,47 +288,20 @@ export async function resetAndRebuild(
     status: 'pending',
     searchResults: [],
     findings: '',
-    findingsEdited: false,
     rollup: '',
     claims: [],
     rollupStale: false,
     rollupIncomplete: false,
+    excludedStatements: [],
+    pendingExclusions: [],
     error: null,
   });
 
-  const depth = getNodeDepth(nodeId);
-  await buildNode(nodeId, signal, depth, MAX_INITIAL_DEPTH);
+  // Mark ancestors stale BEFORE the rebuild attempt. The descendant has
+  // already been wiped, so the parent's rollup is genuinely stale regardless
+  // of whether buildNode succeeds, aborts, or throws.
+  const parentId = node.parentId;
+  if (parentId) markChainStale(parentId);
 
-  const parentId = useTreeStore.getState().tree?.nodes[nodeId]?.parentId ?? null;
-  if (parentId) {
-    await recomputeChain(parentId, signal);
-  }
-}
-
-export async function deepenNode(
-  nodeId: string,
-  customSubquestions: string[],
-  signal?: AbortSignal
-): Promise<void> {
-  const tree = useTreeStore.getState().tree;
-  if (!tree) return;
-  const node = tree.nodes[nodeId];
-  if (!node) return;
-  if (customSubquestions.length === 0) return;
-
-  const currentDepth = getNodeDepth(nodeId);
-  const childMaxDepth = currentDepth + DEEPEN_EXTRA_DEPTH;
-
-  const childIds: string[] = [];
-  for (const sq of customSubquestions) {
-    const child = createNode(nodeId, sq);
-    useTreeStore.getState().upsertNode(child);
-    childIds.push(child.id);
-  }
-
-  await Promise.allSettled(
-    childIds.map((id) => buildNode(id, signal, currentDepth + 1, childMaxDepth))
-  );
-
-  await recomputeChain(nodeId, signal);
+  await buildNode(nodeId, signal);
 }

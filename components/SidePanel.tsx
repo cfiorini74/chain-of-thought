@@ -1,24 +1,25 @@
 'use client';
 
-import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { useTreeStore } from '@/lib/store';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { isNodeBusy, useTreeStore } from '@/lib/store';
 import { callPlanAgent } from '@/lib/agents';
 import {
-  deepenNode,
-  markChainStale,
-  recomputeChain,
+  expandNode,
+  isAbortError,
+  MAX_TOTAL_NODES,
   resetAndRebuild,
+  summarizeSubtree,
 } from '@/lib/orchestrator';
-import type { Claim, ResearchNode, SearchResult } from '@/lib/types';
+import { corroborationCount, normalizeStatement, truncate } from '@/lib/claims';
+import type { Claim, ClaimSource, NodeStatus, ResearchNode, SearchResult } from '@/lib/types';
 import DeepenPopover from './DeepenPopover';
 
-const STATUS_LABEL: Record<string, string> = {
+const STATUS_LABEL: Record<NodeStatus, string> = {
   pending: 'Pending',
   searching: 'Searching…',
   synthesizing: 'Synthesizing…',
-  'rolling-up': 'Rolling up…',
+  'rolling-up': 'Summarizing…',
   done: 'Done',
-  'depth-limit': 'Done (max auto-depth)',
   error: 'Error',
 };
 
@@ -67,36 +68,219 @@ function renderFindings(
   return <>{parts}</>;
 }
 
-function ClaimRow({ claim, ownerNode }: { claim: Claim; ownerNode: ResearchNode }) {
-  const childIds = ownerNode.childIds;
-  const branchNumber = (childId: string | null): string => {
-    if (!childId) return 'this node';
-    const idx = childIds.indexOf(childId);
-    return idx >= 0 ? `Branch ${idx + 1}` : 'unknown branch';
+interface ClaimRowProps {
+  claim: Claim;
+  ownerNode: ResearchNode;
+  nodes: Record<string, ResearchNode>;
+  excluded: boolean;
+  onToggleExclude: (statement: string) => void;
+  onOriginClick: (nodeId: string) => void;
+  onCitationClick: (n: number) => void;
+  sourceCount: number;
+}
+
+const ClaimRow = memo(function ClaimRow({
+  claim,
+  ownerNode,
+  nodes,
+  excluded,
+  onToggleExclude,
+  onOriginClick,
+  onCitationClick,
+  sourceCount,
+}: ClaimRowProps) {
+  // sourceIndices on a child-scoped source point into the child's findings,
+  // not this node's — only own (childId=null) entries yield citations.
+  // Take the first quote associated with each index on this side so users
+  // can tell apart support vs opposition when the same source backs both.
+  const sideCitations = (
+    sources: ClaimSource[]
+  ): { n: number; quote?: string }[] => {
+    const map = new Map<number, string | undefined>();
+    for (const s of sources) {
+      if (s.childId !== null) continue;
+      for (const n of s.sourceIndices ?? []) {
+        if (n < 1 || n > sourceCount) continue;
+        if (!map.has(n)) map.set(n, s.quote);
+      }
+    }
+    return Array.from(map.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([n, quote]) => ({ n, quote }));
   };
 
-  if (claim.opposing.length > 0) {
-    const branches = claim.opposing.map((s) => branchNumber(s.childId));
-    const uniq = Array.from(new Set(branches));
-    return (
-      <li className="text-sm">
-        <span className="font-medium">{claim.topic}.</span>{' '}
-        <span>{claim.statement}</span>{' '}
-        <span className="text-amber-600 dark:text-amber-400">
-          (⚠ contradicted by {uniq.join(', ')})
+  const sideBranches = (
+    sources: ClaimSource[]
+  ): { childId: string; quote?: string }[] => {
+    const seen = new Set<string>();
+    const out: { childId: string; quote?: string }[] = [];
+    for (const s of sources) {
+      if (s.childId === null) continue;
+      if (seen.has(s.childId)) continue;
+      seen.add(s.childId);
+      out.push({ childId: s.childId, quote: s.quote });
+    }
+    return out;
+  };
+
+  const renderCitation = ({
+    n,
+    quote,
+  }: {
+    n: number;
+    quote?: string;
+  }): ReactNode => (
+    <span key={`cite-${n}`}>
+      <button
+        type="button"
+        onClick={() => onCitationClick(n)}
+        className="rounded bg-zinc-100 px-1 py-0 text-xs font-medium text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+      >
+        [{n}]
+      </button>
+      {quote && (
+        <span className="ml-1 italic text-zinc-500 dark:text-zinc-400">
+          “{truncate(quote, 80)}”
         </span>
-      </li>
+      )}
+    </span>
+  );
+
+  const renderBranch = (b: { childId: string; quote?: string }): ReactNode => {
+    const idx = ownerNode.childIds.indexOf(b.childId);
+    const exists = !!nodes[b.childId];
+    const label =
+      idx >= 0 ? `Branch ${idx + 1}` : exists ? 'unknown branch' : 'deleted branch';
+    return (
+      <span key={`branch-${b.childId}`}>
+        {exists ? (
+          <button
+            type="button"
+            onClick={() => onOriginClick(b.childId)}
+            className="font-medium text-blue-600 hover:underline dark:text-blue-400"
+            title={nodes[b.childId]?.query}
+          >
+            {label}
+          </button>
+        ) : (
+          <span className="italic text-zinc-400 dark:text-zinc-600">{label}</span>
+        )}
+        {b.quote && (
+          <span className="ml-1 italic text-zinc-500 dark:text-zinc-400">
+            “{truncate(b.quote, 80)}”
+          </span>
+        )}
+      </span>
     );
-  }
+  };
+
+  const supportItems: ReactNode[] = [
+    ...sideCitations(claim.supporting).map(renderCitation),
+    ...sideBranches(claim.supporting).map(renderBranch),
+  ];
+  const opposeItems: ReactNode[] = [
+    ...sideBranches(claim.opposing).map(renderBranch),
+    ...sideCitations(claim.opposing).map(renderCitation),
+  ];
+
+  const hasSupport = claim.supporting.length > 0;
+  const hasOppose = claim.opposing.length > 0;
+  const corroboration = corroborationCount(claim);
+
+  const bodyClass = excluded
+    ? 'text-zinc-400 line-through dark:text-zinc-600'
+    : '';
 
   return (
     <li className="text-sm">
-      <span className="font-medium">{claim.topic}.</span>{' '}
-      <span>{claim.statement}</span>{' '}
-      <span className="text-emerald-600 dark:text-emerald-400">
-        (✓ supported by {claim.supporting.length})
-      </span>
+      <div className="flex items-start gap-1.5">
+        <button
+          type="button"
+          onClick={() => onToggleExclude(claim.statement)}
+          aria-label={excluded ? 'Re-include this claim' : 'Exclude this claim from bubbling up'}
+          title={
+            excluded
+              ? 'Re-include this claim (will be sent up on next Summarize)'
+              : 'Exclude this claim from bubbling up (takes effect on next Summarize)'
+          }
+          className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-xs leading-none text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+        >
+          {excluded ? '↶' : '×'}
+        </button>
+        <div className={`flex-1 ${bodyClass}`}>
+          <span className="font-medium">{claim.topic}.</span>{' '}
+          {claim.statement}
+          {corroboration > 1 && (
+            <span className="ml-1.5 inline-block rounded bg-emerald-50 px-1.5 py-0.5 align-middle text-[10px] font-medium text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
+              ✓ in {corroboration} branches
+            </span>
+          )}
+          {hasSupport && (
+            <div className="mt-0.5 text-xs text-emerald-700 dark:text-emerald-400">
+              ✓ Supported by{' '}
+              {supportItems.length > 0
+                ? joinWithComma(supportItems)
+                : `${claim.supporting.length} source${claim.supporting.length === 1 ? '' : 's'}`}
+            </div>
+          )}
+          {hasOppose && (
+            <div className="mt-0.5 text-xs text-amber-700 dark:text-amber-400">
+              ⚠ Contradicted by{' '}
+              {opposeItems.length > 0
+                ? joinWithComma(opposeItems)
+                : `${claim.opposing.length} source${claim.opposing.length === 1 ? '' : 's'}`}
+            </div>
+          )}
+          {claim.originNodeIds.length > 0 && (
+            <div className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+              From:{' '}
+              {claim.originNodeIds.map((id, i) => (
+                <span key={id}>
+                  {i > 0 && ', '}
+                  {renderOrigin(id, ownerNode.id, nodes, onOriginClick)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </li>
+  );
+});
+
+function joinWithComma(items: ReactNode[]): ReactNode {
+  return items.map((item, i) => (
+    <span key={i}>
+      {i > 0 ? ', ' : ''}
+      {item}
+    </span>
+  ));
+}
+
+function renderOrigin(
+  id: string,
+  ownerId: string,
+  nodes: Record<string, ResearchNode>,
+  onClick: (nodeId: string) => void
+): ReactNode {
+  if (id === ownerId) return <span className="italic">this node</span>;
+  const target = nodes[id];
+  if (!target) {
+    return (
+      <span className="italic text-zinc-400 dark:text-zinc-600">
+        deleted node
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(id)}
+      className="text-blue-600 hover:underline dark:text-blue-400"
+      title={target.query}
+    >
+      “{truncate(target.query, 50)}”
+    </button>
   );
 }
 
@@ -121,31 +305,29 @@ export default function SidePanel() {
   const tree = useTreeStore((s) => s.tree);
   const selectedNodeId = useTreeStore((s) => s.selectedNodeId);
   const selectNode = useTreeStore((s) => s.selectNode);
-  const reshapeOpInFlight = useTreeStore((s) => s.reshapeOpInFlight);
-  const setReshapeOpInFlight = useTreeStore((s) => s.setReshapeOpInFlight);
+  const inFlightOps = useTreeStore((s) => s.inFlightOps);
+  const startOp = useTreeStore((s) => s.startOp);
+  const endOp = useTreeStore((s) => s.endOp);
 
   const [editingQuery, setEditingQuery] = useState(false);
   const [queryDraft, setQueryDraft] = useState('');
-  const [editingFindings, setEditingFindings] = useState(false);
-  const [findingsDraft, setFindingsDraft] = useState('');
   const [highlightedSource, setHighlightedSource] = useState<number | null>(null);
-  const [deepenSuggestions, setDeepenSuggestions] = useState<string[] | null>(null);
-  const [deepenLoading, setDeepenLoading] = useState(false);
+  const [expandRows, setExpandRows] = useState<string[] | null>(null);
+  const [plannerLoading, setPlannerLoading] = useState(false);
 
-  const controllerRef = useRef<AbortController | null>(null);
+  // Planner fetch outlives node switches; the resolve handler in startExpand
+  // gates on controller identity + selected node so stale results are dropped.
+  const plannerControllerRef = useRef<AbortController | null>(null);
 
-  // Reset edit state when the selected node changes
   useEffect(() => {
     setEditingQuery(false);
-    setEditingFindings(false);
-    setDeepenSuggestions(null);
-    setDeepenLoading(false);
+    setExpandRows(null);
+    setPlannerLoading(false);
   }, [selectedNodeId]);
 
-  // Abort any in-flight reshape op when the panel unmounts
   useEffect(() => {
     return () => {
-      controllerRef.current?.abort();
+      plannerControllerRef.current?.abort();
     };
   }, []);
 
@@ -156,41 +338,46 @@ export default function SidePanel() {
   const isError = node.status === 'error';
   const isRoot = node.parentId === null;
   const hasChildren = node.childIds.length > 0;
-  const isFinishedNode = node.status === 'done' || node.status === 'depth-limit';
+  const isFinishedNode = node.status === 'done';
   const initialBuildSettled = tree.initialBuildSettled;
 
-  // Reshape buttons disabled when the tree hasn't settled or another reshape op is in flight.
-  const reshapeDisabled = !initialBuildSettled || reshapeOpInFlight;
+  const nodeBusy = isNodeBusy(node.id, tree, inFlightOps);
+  const reshapeDisabled = !initialBuildSettled || nodeBusy;
+  const totalNodes = Object.keys(tree.nodes).length;
+  const atCapacity = totalNodes >= MAX_TOTAL_NODES;
 
-  // Per the action contract:
-  // - error nodes: Edit query + Delete only
-  // - leaf done/depth-limit: Edit findings+Recompute, Edit query, Deepen, Delete
-  // - internal done: Edit findings+Recompute, Edit query, Delete (no Deepen)
-  // - in-flight (searching/synthesizing/rolling-up/pending): no actions
+  const sortedClaims = useMemo(
+    () =>
+      [...node.claims].sort(
+        (a, b) => corroborationCount(b) - corroborationCount(a)
+      ),
+    [node.claims]
+  );
+
   const showFindingsBlock = !isError;
-  const showRecomputeButton = isFinishedNode;
-  const showDeepenButton = isFinishedNode && !hasChildren;
+  // Leaves usually hide Summarize, but expose it when the leaf is stale or
+  // has no claims so the user has a retry path after a rollup abort or
+  // empty model output.
+  const showSummarizeButton =
+    isFinishedNode &&
+    (hasChildren || node.rollupStale || node.claims.length === 0);
+  const showExpandButton = isFinishedNode;
   const showDeleteButton = !isRoot;
   const showQueryEdit = isFinishedNode || isError;
-  const showFindingsEdit = isFinishedNode;
 
-  function newSignal(): AbortSignal {
-    controllerRef.current?.abort();
-    const c = new AbortController();
-    controllerRef.current = c;
-    return c.signal;
-  }
-
-  function handleCitationClick(n: number) {
-    const el = document.getElementById(sourceRowId(node.id, n));
-    if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setHighlightedSource(n);
-    window.setTimeout(
-      () => setHighlightedSource((cur) => (cur === n ? null : cur)),
-      1000
-    );
-  }
+  const handleCitationClick = useCallback(
+    (n: number) => {
+      const el = document.getElementById(sourceRowId(node.id, n));
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setHighlightedSource(n);
+      window.setTimeout(
+        () => setHighlightedSource((cur) => (cur === n ? null : cur)),
+        1000
+      );
+    },
+    [node.id]
+  );
 
   // === Edit query ===
   function startEditQuery() {
@@ -212,51 +399,41 @@ export default function SidePanel() {
       return;
     }
     setEditingQuery(false);
-    const signal = newSignal();
-    setReshapeOpInFlight(true);
+    const originId = node.id;
+    const controller = new AbortController();
+    startOp(originId, controller);
     try {
-      await resetAndRebuild(node.id, next, signal);
+      await resetAndRebuild(originId, next, controller.signal);
     } catch (e) {
-      if ((e as { name?: string })?.name !== 'AbortError') {
+      if (!isAbortError(e)) {
         console.error('resetAndRebuild failed:', e);
       }
     } finally {
-      setReshapeOpInFlight(false);
+      endOp(originId);
     }
   }
 
-  // === Edit findings ===
-  function startEditFindings() {
-    setFindingsDraft(node.findings);
-    setEditingFindings(true);
-  }
-  function saveEditFindings() {
-    useTreeStore.getState().updateNode(node.id, {
-      findings: findingsDraft,
-      findingsEdited: true,
-    });
-    setEditingFindings(false);
-  }
+  // === Toggle claim exclusion ===
+  const handleToggleExclude = useCallback(
+    (statement: string) => {
+      useTreeStore.getState().toggleClaimExclusion(node.id, statement);
+    },
+    [node.id]
+  );
 
-  // === Recompute ===
-  async function recompute() {
-    if (!node.findingsEdited) return;
-    const signal = newSignal();
-    setReshapeOpInFlight(true);
+  // === Summarize ===
+  async function summarize() {
+    const originId = node.id;
+    const controller = new AbortController();
+    startOp(originId, controller);
     try {
-      markChainStale(node.id);
-      await recomputeChain(node.id, signal);
-      // Only clear the dirty flag if recompute actually completed.
-      // recomputeChain swallows AbortError, so signal.aborted is the source of truth.
-      if (!signal.aborted) {
-        useTreeStore.getState().updateNode(node.id, { findingsEdited: false });
-      }
+      await summarizeSubtree(originId, controller.signal);
     } catch (e) {
-      if ((e as { name?: string })?.name !== 'AbortError') {
-        console.error('recompute failed:', e);
+      if (!isAbortError(e)) {
+        console.error('summarize failed:', e);
       }
     } finally {
-      setReshapeOpInFlight(false);
+      endOp(originId);
     }
   }
 
@@ -270,68 +447,73 @@ export default function SidePanel() {
     if (!window.confirm(message)) return;
 
     const parentId = node.parentId;
-    const signal = newSignal();
-    setReshapeOpInFlight(true);
-    try {
+    if (!parentId) {
       useTreeStore.getState().deleteSubtree(node.id);
-      // Move selection to parent so SidePanel stays mounted while recompute runs.
-      // Unmounting (selectNode(null)) would abort the controller.
-      if (parentId) {
-        useTreeStore.getState().selectNode(parentId);
-        await recomputeChain(parentId, signal);
-      } else {
-        useTreeStore.getState().selectNode(null);
-      }
-    } catch (e) {
-      if ((e as { name?: string })?.name !== 'AbortError') {
-        console.error('delete failed:', e);
-      }
-    } finally {
-      setReshapeOpInFlight(false);
+      useTreeStore.getState().selectNode(null);
+      return;
     }
+    useTreeStore.getState().deleteSubtree(node.id);
+    useTreeStore.getState().selectNode(parentId);
   }
 
-  // === Deepen ===
-  async function startDeepen() {
+  // === Expand ===
+  async function startExpand() {
+    // Re-expansion (children exist): skip the planner so user-added
+    // sub-questions are fully custom and not duplicates of prior suggestions.
+    if (hasChildren) {
+      setExpandRows(['']);
+      return;
+    }
+
+    // Initial expansion: seed with planner suggestions the user can edit.
     const startNodeId = node.id;
-    setDeepenLoading(true);
+    setPlannerLoading(true);
     const rootQuery = tree?.nodes[tree.rootId]?.query ?? node.query;
-    const signal = newSignal();
-    const isStillCurrent = () =>
+    plannerControllerRef.current?.abort();
+    const controller = new AbortController();
+    plannerControllerRef.current = controller;
+    const isCurrent = () =>
+      plannerControllerRef.current === controller &&
       useTreeStore.getState().selectedNodeId === startNodeId;
     try {
-      const result = await callPlanAgent(node.query, node.findings, rootQuery, signal);
-      if (!isStillCurrent()) return;
+      const result = await callPlanAgent(
+        node.query,
+        node.findings,
+        rootQuery,
+        controller.signal
+      );
+      if (!isCurrent()) return;
       const subs = result.subquestions.length > 0 ? result.subquestions : [''];
-      setDeepenSuggestions(subs);
+      setExpandRows(subs);
     } catch (e) {
-      if ((e as { name?: string })?.name === 'AbortError') return;
-      if (!isStillCurrent()) return;
+      if (isAbortError(e)) return;
+      if (!isCurrent()) return;
       console.error('planner call failed:', e);
-      setDeepenSuggestions(['']);
+      setExpandRows(['']);
     } finally {
-      if (isStillCurrent()) setDeepenLoading(false);
+      if (isCurrent()) setPlannerLoading(false);
     }
   }
-  async function confirmDeepen(rows: string[]) {
+  async function confirmExpand(rows: string[]) {
     const filtered = rows.map((s) => s.trim()).filter(Boolean);
-    setDeepenSuggestions(null);
+    setExpandRows(null);
     if (filtered.length === 0) return;
-    const signal = newSignal();
-    setReshapeOpInFlight(true);
+    const originId = node.id;
+    const controller = new AbortController();
+    startOp(originId, controller);
     try {
-      await deepenNode(node.id, filtered, signal);
+      await expandNode(originId, filtered, controller.signal);
     } catch (e) {
-      if ((e as { name?: string })?.name !== 'AbortError') {
-        console.error('deepenNode failed:', e);
+      if (!isAbortError(e)) {
+        console.error('expandNode failed:', e);
       }
     } finally {
-      setReshapeOpInFlight(false);
+      endOp(originId);
     }
   }
 
   const sources = node.searchResults;
-  const popoverActive = deepenSuggestions !== null;
+  const popoverActive = expandRows !== null;
 
   return (
     <aside className="flex h-full w-[420px] flex-col border-l border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
@@ -400,41 +582,39 @@ export default function SidePanel() {
 
         {showFindingsBlock && (
           <>
-            <Section
-              label="Findings"
-              right={
-                showFindingsEdit && !editingFindings ? (
-                  <EditButton onClick={startEditFindings} disabled={reshapeDisabled} />
-                ) : undefined
-              }
-            >
-              {editingFindings ? (
-                <div className="flex flex-col gap-2">
-                  <textarea
-                    value={findingsDraft}
-                    onChange={(e) => setFindingsDraft(e.target.value)}
-                    rows={10}
-                    autoFocus
-                    className="w-full resize-y rounded border border-zinc-300 bg-white px-2 py-1 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                  />
-                  <div className="flex justify-end gap-2">
-                    <SecondaryButton onClick={() => setEditingFindings(false)}>
-                      Cancel
-                    </SecondaryButton>
-                    <PrimaryButton
-                      onClick={saveEditFindings}
-                      disabled={findingsDraft === node.findings}
-                    >
-                      Save
-                    </PrimaryButton>
-                  </div>
-                </div>
-              ) : (
-                <div className="text-sm leading-relaxed whitespace-pre-wrap">
-                  {renderFindings(node.findings, sources, handleCitationClick)}
-                </div>
-              )}
+            <Section label="Findings">
+              <div className="text-sm leading-relaxed whitespace-pre-wrap">
+                {renderFindings(node.findings, sources, handleCitationClick)}
+              </div>
             </Section>
+
+            {isFinishedNode && (
+              <Section label="Claims">
+                {node.claims.length === 0 ? (
+                  <p className="text-sm text-zinc-500 italic">
+                    no claims extracted{hasChildren ? ' — try Summarize to retry' : ''}
+                  </p>
+                ) : (
+                  <ul className="space-y-1.5">
+                    {sortedClaims.map((c, i) => (
+                      <ClaimRow
+                        key={`${c.topic}-${i}`}
+                        claim={c}
+                        ownerNode={node}
+                        nodes={tree.nodes}
+                        excluded={node.excludedStatements.includes(
+                          normalizeStatement(c.statement)
+                        )}
+                        onToggleExclude={handleToggleExclude}
+                        onOriginClick={selectNode}
+                        onCitationClick={handleCitationClick}
+                        sourceCount={sources.length}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </Section>
+            )}
 
             <Section label="Sources">
               {sources.length === 0 ? (
@@ -478,16 +658,6 @@ export default function SidePanel() {
                 </ul>
               )}
             </Section>
-
-            {node.claims.length > 0 && (
-              <Section label="Claims">
-                <ul className="space-y-1.5 list-disc pl-5">
-                  {node.claims.map((c, i) => (
-                    <ClaimRow key={`${c.topic}-${i}`} claim={c} ownerNode={node} />
-                  ))}
-                </ul>
-              </Section>
-            )}
           </>
         )}
       </div>
@@ -496,32 +666,33 @@ export default function SidePanel() {
       <div className="shrink-0 border-t border-zinc-200 p-3 dark:border-zinc-800">
         {popoverActive ? (
           <DeepenPopover
-            initialSuggestions={deepenSuggestions ?? []}
-            disabled={reshapeOpInFlight}
-            onCancel={() => setDeepenSuggestions(null)}
-            onConfirm={confirmDeepen}
+            initialSuggestions={expandRows ?? []}
+            disabled={nodeBusy}
+            onCancel={() => setExpandRows(null)}
+            onConfirm={confirmExpand}
           />
         ) : (
           <div className="flex flex-wrap items-center justify-end gap-2">
-            {showRecomputeButton && (
+            {showSummarizeButton && (
               <SecondaryButton
-                onClick={recompute}
-                disabled={reshapeDisabled || !node.findingsEdited}
-                title={
-                  node.findingsEdited
-                    ? 'Recompute rollups upward from this node'
-                    : 'Edit findings first to enable recompute'
-                }
+                onClick={summarize}
+                disabled={reshapeDisabled}
+                title="Roll up this node and its descendants"
               >
-                Recompute
+                Summarize
               </SecondaryButton>
             )}
-            {showDeepenButton && (
+            {showExpandButton && (
               <SecondaryButton
-                onClick={startDeepen}
-                disabled={reshapeDisabled || deepenLoading}
+                onClick={startExpand}
+                disabled={reshapeDisabled || plannerLoading || atCapacity}
+                title={
+                  atCapacity
+                    ? `Tree is at the ${MAX_TOTAL_NODES}-node cap`
+                    : undefined
+                }
               >
-                {deepenLoading ? 'Planning…' : 'Deepen'}
+                {plannerLoading ? 'Planning…' : 'Expand'}
               </SecondaryButton>
             )}
             {showDeleteButton && (

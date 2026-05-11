@@ -2,6 +2,7 @@
 
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import { useTreeStore } from '@/lib/store';
+import { truncate } from '@/lib/claims';
 import type { ResearchNode } from '@/lib/types';
 
 type ResearchFlowNode = Node<{ node: ResearchNode }, 'research'>;
@@ -12,11 +13,6 @@ const STATUS_LABEL: Record<string, string> = {
   synthesizing: 'synthesizing…',
   'rolling-up': 'rolling up…',
 };
-
-function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1).trimEnd() + '…';
-}
 
 function firstLine(s: string): string {
   return s.split(/\r?\n/, 1)[0] ?? s;
@@ -30,7 +26,9 @@ export default function NodeCard({ data }: NodeProps<ResearchFlowNode>) {
   const isSelected = selectedNodeId === node.id;
   const inProgress = node.status in STATUS_LABEL;
   const isError = node.status === 'error';
-  const isDepthLimit = node.status === 'depth-limit';
+  const isDone = node.status === 'done';
+  const isStale =
+    isDone && (node.rollupStale || node.pendingExclusions.length > 0);
 
   const claimCount = node.claims.length;
   const contradictedCount = node.claims.filter((c) => c.opposing.length > 0).length;
@@ -87,11 +85,11 @@ export default function NodeCard({ data }: NodeProps<ResearchFlowNode>) {
         </div>
       )}
 
-      {(isDepthLimit || rolledUpTag) && (
+      {(isStale || rolledUpTag) && (
         <div className="mt-2 flex flex-wrap gap-1">
-          {isDepthLimit && (
-            <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
-              Max auto-depth
+          {isStale && (
+            <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+              summary stale
             </span>
           )}
           {rolledUpTag && (

@@ -45,7 +45,7 @@ export default function DeepenPopover({
   return (
     <div className="rounded-md border border-zinc-300 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-900">
       <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-600 dark:text-zinc-400">
-        Suggested sub-questions
+        New sub-questions
       </div>
       <div className="space-y-1.5">
         {rows.map((row, i) => (

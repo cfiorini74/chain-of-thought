@@ -22,7 +22,7 @@ export async function POST(request: NextRequest) {
       model: MODELS.search,
       systemPrompt: SEARCH_SYNTHESIS_SYSTEM,
       userPrompt: `You are researching: ${body.query}\n\nSearch results:\n${numbered}`,
-      maxTokens: 1500,
+      maxTokens: 900,
       signal: request.signal,
     });
 
